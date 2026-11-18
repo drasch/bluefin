@@ -172,8 +172,10 @@ tag-images $image_name="" $default_tag="" $tags="":
 # Switch the running bootc system to the locally built image.
 #
 # Copies the image from the user (rootless) Podman storage into the rootful
-# storage bootc reads, then runs `bootc switch --transport containers-storage`.
-# A reboot applies the staged deployment.
+# storage bootc reads, then runs `bootc switch --transport containers-storage`
+# to stage the deployment. Nothing reboots automatically; you apply the staged
+# deployment yourself with `sudo bootc upgrade --apply` or `sudo systemctl
+# reboot`.
 #
 # Example: just bootc-switch
 # just bootc-switch bluefin-cosmic-dx-nvidia stable
@@ -223,11 +225,11 @@ bootc-switch $target_image=image_name $tag=default_tag:
     fi
 
     if sudoif bootc switch --transport containers-storage "${image}" 2>&1 | grep -q "Image specification is unchanged"; then
-        echo "Image spec unchanged — applying same-spec update via bootc upgrade."
-        sudoif bootc upgrade --apply
+        echo "Image spec unchanged — staging same-spec update via 'bootc upgrade' (no reboot)."
+        sudoif bootc upgrade
     fi
 
-    echo "Reboot to boot into the new deployment."
+    echo "Staged. Apply with 'sudo bootc upgrade --apply' (reboots) or 'sudo systemctl reboot'."
 
 # Compare the upstream base image (CONTAINER_BASE_IMAGE) with the local copy.
 #
@@ -323,12 +325,12 @@ pull-upstream $base_image="":
     podman pull --signature-policy policy-dev.json "${base_image}"
     echo "✓ Now at $(podman image inspect "${base_image}" | jq -r '.[0].Digest')."
 
-# Full update pipeline: light checks → pull upstream base → rebuild → switch.
+# Full update pipeline: light checks → pull upstream base → rebuild → stage.
 #
 # Skips the rebuild when check-upstream reports the base already current;
 # pass "force" as the first argument to rebuild regardless. The bootc-switch
 # step copies the built image into rootful storage and stages the deployment;
-# a reboot completes it.
+# nothing reboots automatically — you choose when to apply it.
 #
 # Example: just pipeline
 # just pipeline force
@@ -362,7 +364,7 @@ pipeline *args="":
 
     echo "── Step 4/4: staging deployment ──"
     just bootc-switch
-    echo "✓ Pipeline complete. Reboot to boot into the new deployment."
+    echo "✓ Pipeline complete. Deployment staged — apply with 'sudo bootc upgrade --apply' (reboots)."
 
 # Command: _rootful_load_image
 # Description: This script checks if the current user is root or running under sudo. If not, it attempts to resolve the image tag using podman inspect.
