@@ -1,0 +1,36 @@
+{
+  "default": [
+    {
+      "type": "reject"
+    }
+  ],
+  "transports": {
+    "docker": {
+      "": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "ghcr.io/projectbluefin/common": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "ghcr.io/ublue-os/brew": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "ghcr.io/ublue-os/bluefin-dx": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ],
+      "ghcr.io/ublue-os/bluefin-dx-nvidia-open": [
+        {
+          "type": "insecureAcceptAnything"
+        }
+      ]
+    }
+  }
+}

@@ -113,6 +113,7 @@ build $target_image=image_name $tag=default_tag:
 
     podman build \
         "${BUILD_ARGS[@]}" \
+        --signature-policy policy-dev.json \
         --pull=newer \
         --tag "${target_image}:${tag}" \
         .
@@ -129,6 +130,7 @@ build-nvidia $target_image=image_name_nvidia $tag=default_tag:
     podman build \
         "${BUILD_ARGS[@]}" \
         --build-arg BASE_IMAGE=ghcr.io/ublue-os/bluefin-dx-nvidia-open:stable-daily \
+        --signature-policy policy-dev.json \
         --pull=newer \
         --tag "${target_image}:${tag}" \
         .
@@ -166,6 +168,201 @@ tag-images $image_name="" $default_tag="" $tags="":
     done
 
     echo "Tagged ${image_name}:${default_tag} with: ${tags}"
+
+# Switch the running bootc system to the locally built image.
+#
+# Copies the image from the user (rootless) Podman storage into the rootful
+# storage bootc reads, then runs `bootc switch --transport containers-storage`.
+# A reboot applies the staged deployment.
+#
+# Example: just bootc-switch
+# just bootc-switch bluefin-cosmic-dx-nvidia stable
+[group('Image')]
+bootc-switch $target_image=image_name $tag=default_tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    function sudoif(){
+        if [[ "${UID}" -eq 0 ]]; then
+            "$@"
+        elif [[ "$(command -v sudo)" && -n "${SSH_ASKPASS:-}" ]] && [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+            /usr/bin/sudo --askpass "$@" || exit 1
+        elif [[ "$(command -v sudo)" ]]; then
+            /usr/bin/sudo "$@" || exit 1
+        else
+            exit 1
+        fi
+    }
+
+    image="${target_image}:${tag}"
+    if [[ "${image}" != localhost/* ]]; then
+        image="localhost/${image}"
+    fi
+
+    if ! podman image exists "${image}"; then
+        echo "Image ${image} not found in user Podman storage. Run 'just build' first." >&2
+        exit 1
+    fi
+
+    # Ensure the rootful store (which bootc reads) holds the same image as the
+    # user store bootc-switch builds from. Copy whenever the digests differ,
+    # not only when the image is missing — otherwise stale rootful copies of
+    # the same tag shadow newly built images in bootc upgrade.
+    local_digest="$(podman image inspect "${image}" | jq -r '.[0].Digest')"
+    if ! root_digest="$(sudoif podman image inspect "${image}" | jq -r '.[0].Digest' 2>/dev/null)" || [[ "${root_digest}" != "${local_digest}" ]]; then
+        echo "Copying ${image} into rootful storage (digests differ) ..."
+        COPYTMP="$(mktemp -p "${PWD}" -d -t _bootc_scp.XXXXXXXXXX)"
+        trap 'rm -rf "${COPYTMP}"' EXIT
+        # podman image scp user<->root on one host needs the API sockets:
+        #   systemctl --user enable --now podman.socket  (user side, done at first run)
+        #   systemctl enable --now podman.socket         (root side, preinstalled on bootc)
+        sudoif env TMPDIR="${COPYTMP}" podman image scp \
+            "$(id -un)@localhost::${image}" "root@localhost::${image}"
+    else
+        echo "Rootful storage already has ${image} at ${root_digest}."
+    fi
+
+    if sudoif bootc switch --transport containers-storage "${image}" 2>&1 | grep -q "Image specification is unchanged"; then
+        echo "Image spec unchanged — applying same-spec update via bootc upgrade."
+        sudoif bootc upgrade --apply
+    fi
+
+    echo "Reboot to boot into the new deployment."
+
+# Compare the upstream base image (CONTAINER_BASE_IMAGE) with the local copy.
+#
+# Uses skopeo to read the registry digest for the tag the build actually uses
+# (BASE_IMAGE from the Containerfile) and reports whether the local image is
+# current. Pull with: podman pull --signature-policy policy-dev.json <image>
+#
+# Requires: skopeo, jq.
+#
+# Example: just check-upstream
+[group('Image')]
+check-upstream $base_image="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -z "${base_image}" ]]; then
+        base_image="$(sed -n 's/^ARG BASE_IMAGE=//p' Containerfile | head -1)"
+    fi
+    if [[ -z "${base_image}" ]]; then
+        echo "Could not determine BASE_IMAGE from Containerfile." >&2
+        exit 1
+    fi
+
+    if ! command -v skopeo &>/dev/null; then
+        echo "skopeo is required: sudo dnf5 install skopeo" >&2
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required: sudo dnf5 install jq" >&2
+        exit 1
+    fi
+
+    echo "Checking ${base_image} ..."
+    remote_digest="$(skopeo inspect "docker://${base_image}" | jq -r .Digest)"
+    remote_created="$(skopeo inspect "docker://${base_image}" | jq -r .Created)"
+
+    if local_digest="$(podman image inspect "${base_image}" | jq -r '.[0].Digest')"; then
+        if [[ "${local_digest}" == "${remote_digest}" ]]; then
+            echo "✓ Up to date. Digest ${remote_digest} (built upstream ${remote_created})"
+        else
+            echo "✗ New upstream build available."
+            echo "  remote: ${remote_digest} (built upstream ${remote_created})"
+            echo "  local:  ${local_digest}"
+            echo "  pull:   podman pull --signature-policy policy-dev.json ${base_image}"
+            exit 1
+        fi
+    else
+        echo "⚠ Not pulled locally yet."
+        echo "  remote: ${remote_digest} (built upstream ${remote_created})"
+        echo "  pull:   podman pull --signature-policy policy-dev.json ${base_image}"
+        exit 1
+    fi
+
+# Pull the upstream base image if the registry has a newer build.
+#
+# No-op when the local copy already matches the registry digest. Uses the same
+# BASE_IMAGE detection as check-upstream; pass an image to override.
+#
+# Example: just pull-upstream
+[group('Image')]
+pull-upstream $base_image="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [[ -z "${base_image}" ]]; then
+        base_image="$(sed -n 's/^ARG BASE_IMAGE=//p' Containerfile | head -1)"
+    fi
+    if [[ -z "${base_image}" ]]; then
+        echo "Could not determine BASE_IMAGE from Containerfile." >&2
+        exit 1
+    fi
+
+    if ! command -v skopeo &>/dev/null; then
+        echo "skopeo is required: sudo dnf5 install skopeo" >&2
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required: sudo dnf5 install jq" >&2
+        exit 1
+    fi
+
+    remote_digest="$(skopeo inspect "docker://${base_image}" | jq -r .Digest)"
+    if local_digest="$(podman image inspect "${base_image}" | jq -r '.[0].Digest' 2>/dev/null)"; then
+        if [[ "${local_digest}" == "${remote_digest}" ]]; then
+            echo "✓ ${base_image} already current (${remote_digest})."
+            exit 0
+        fi
+        echo "Pulling updated ${base_image} ..."
+    else
+        echo "Pulling ${base_image} (not present locally) ..."
+    fi
+
+    podman pull --signature-policy policy-dev.json "${base_image}"
+    echo "✓ Now at $(podman image inspect "${base_image}" | jq -r '.[0].Digest')."
+
+# Full update pipeline: light checks → pull upstream base → rebuild → switch.
+#
+# Skips the rebuild when check-upstream reports the base already current;
+# pass "force" as the first argument to rebuild regardless. The bootc-switch
+# step copies the built image into rootful storage and stages the deployment;
+# a reboot completes it.
+#
+# Example: just pipeline
+# just pipeline force
+[group('Image')]
+pipeline *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    force=""
+    if [[ "${args:-}" == *force* ]]; then
+        force="force"
+    fi
+
+    echo "── Step 1/4: light checks ──"
+    just check
+    # shellcheck (just lint) runs in CI; not gated here.
+
+    echo "── Step 2/4: upstream base ──"
+    if [[ -z "${force}" ]]; then
+        if just check-upstream; then
+            echo "Base image current — skipping pull and rebuild."
+            exit 0
+        fi
+    else
+        echo "Force mode: rebuilding regardless of base state."
+    fi
+    just pull-upstream
+
+    echo "── Step 3/4: rebuild ──"
+    just build
+
+    echo "── Step 4/4: staging deployment ──"
+    just bootc-switch
+    echo "✓ Pipeline complete. Reboot to boot into the new deployment."
 
 # Command: _rootful_load_image
 # Description: This script checks if the current user is root or running under sudo. If not, it attempts to resolve the image tag using podman inspect.
